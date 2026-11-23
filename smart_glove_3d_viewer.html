@@ -230,6 +230,10 @@ canvas{display:block;width:100%!important;height:100%!important;outline:none}
 
   <!-- Interactive Action Buttons -->
   <div class="navGroup">
+    <button class="btn active" id="btnOrient" onclick="toggleOrientation()" title="Toggle Vertical Upright / Flat Mode">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 2v20M2 12h20"/></svg>
+      Pose: Vertical
+    </button>
     <button class="btn" id="btnExplode" onclick="toggleExplode()" title="Exploded Assembly View">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 8l8-4 8 4-8 4-8-4zm0 8l8 4 8-4M4 12l8 4 8-4"/></svg>
       Explode
@@ -623,16 +627,27 @@ const GESTURES = [
 // THREE.JS GLOBAL SETUP & STATE
 // ============================================================
 let scene, camera, renderer, controls, raycaster, mouse;
+let mainGloveGroup;
 let gloveGroup, compGroup, wireGroup, mountGroup, sensorGroup;
 let fingerJoints = []; // [{root, joints:[jNode], flexMesh, def}]
 let allInteractables = []; // [{mesh, id, pos}]
 let hoveredObj = null, selectedCompId = 'esp32';
+
+let isVertical = true; // DEFAULT VERTICAL UPRIGHT POSE: FINGERS UP, WRIST DOWN
+let targetGroupRot = {x: Math.PI / 2, y: Math.PI, z: 0};
+let targetGroupPos = {x: 0, y: -0.015, z: 0};
 
 let isExploded = false, explodeT = 0, targetExplodeT = 0;
 let isPowered = true;
 let isOnline = false;
 let currentSignalMode = 'all'; // 'all', 'power', 'sensor', 'audio'
 let activeGestureIdx = 0;
+
+// Smooth gesture animation state
+let currentBends = [0, 0, 0, 0, 0];
+let targetBends  = [0, 0, 0, 0, 0];
+const BEND_LERP_SPEED = 0.10; // Higher = faster snap, 0.10 = smooth ~300ms
+const BEND_SNAP_THRESHOLD = 0.3; // Degrees - snap to target below this
 
 let audioCtx = null;
 let speakerMesh = null, speakerVibTimer = 0;
@@ -646,7 +661,7 @@ scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f17);
 
 camera = new THREE.PerspectiveCamera(38, container.clientWidth / container.clientHeight, 0.01, 50);
-camera.position.set(0.18, 0.22, 0.32);
+camera.position.set(0.14, 0.08, 0.28);
 
 renderer = new THREE.WebGLRenderer({antialias:true, alpha:false, powerPreference:'high-performance'});
 renderer.setSize(container.clientWidth, container.clientHeight);
@@ -661,7 +676,7 @@ container.appendChild(renderer.domElement);
 controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
-controls.target.set(0, 0.008, 0);
+controls.target.set(0, 0.02, 0);
 controls.maxDistance = 1.2;
 controls.minDistance = 0.06;
 
@@ -672,7 +687,7 @@ mouse = new THREE.Vector2(-999, -999);
 scene.add(new THREE.AmbientLight(0xdbeafe, 0.65));
 
 const keyLight = new THREE.DirectionalLight(0xfff8ee, 1.25);
-keyLight.position.set(0.35, 0.7, 0.45);
+keyLight.position.set(0.35, 0.45, 0.55);
 keyLight.castShadow = true;
 keyLight.shadow.mapSize.set(2048, 2048);
 keyLight.shadow.camera.near = 0.1;
@@ -685,11 +700,11 @@ keyLight.shadow.bias = -0.0003;
 scene.add(keyLight);
 
 const fillLight = new THREE.DirectionalLight(0x7dd3fc, 0.48);
-fillLight.position.set(-0.5, 0.35, -0.3);
+fillLight.position.set(-0.45, 0.25, -0.35);
 scene.add(fillLight);
 
 const rimLight = new THREE.DirectionalLight(0xffedd5, 0.38);
-rimLight.position.set(0.1, 0.15, -0.6);
+rimLight.position.set(0.10, 0.35, -0.50);
 scene.add(rimLight);
 
 // Studio Matte Floor
@@ -697,22 +712,28 @@ const floorGeo = new THREE.PlaneGeometry(3, 3);
 const floorMat = new THREE.MeshStandardMaterial({color:0xd3d8e0, roughness:0.85, metalness:0.02});
 const floor = new THREE.Mesh(floorGeo, floorMat);
 floor.rotation.x = -Math.PI / 2;
-floor.position.y = -0.026;
+floor.position.y = -0.130;
 floor.receiveShadow = true;
 scene.add(floor);
 
 // Root Assembly Groups
+mainGloveGroup = new THREE.Group(); mainGloveGroup.name = 'mainGloveGroup';
+// Set initial vertical upright posture: Fingers UP (+Y), Wrist DOWN (-Y), Dorsal components facing FRONT (+Z)
+mainGloveGroup.rotation.set(Math.PI / 2, Math.PI, 0);
+mainGloveGroup.position.set(0, -0.015, 0);
+scene.add(mainGloveGroup);
+
 gloveGroup = new THREE.Group(); gloveGroup.name = 'glove';
 compGroup  = new THREE.Group(); compGroup.name  = 'components';
 wireGroup  = new THREE.Group(); wireGroup.name  = 'wiring';
 mountGroup = new THREE.Group(); mountGroup.name = 'mount';
 sensorGroup= new THREE.Group(); sensorGroup.name= 'sensors';
 
-scene.add(gloveGroup);
-scene.add(compGroup);
-scene.add(wireGroup);
-scene.add(mountGroup);
-scene.add(sensorGroup);
+mainGloveGroup.add(gloveGroup);
+mainGloveGroup.add(compGroup);
+mainGloveGroup.add(wireGroup);
+mainGloveGroup.add(mountGroup);
+mainGloveGroup.add(sensorGroup);
 
 // ============================================================
 // PROCEDURAL CANVAS TEXTURE GENERATORS
@@ -1693,7 +1714,7 @@ function buildWiring(){
 
   W.add(makeWire([battP.clone().add(new THREE.Vector3(0.005,0.002,0.01)), new THREE.Vector3(0.005,0.004,-0.082), tpP.clone().add(new THREE.Vector3(-0.004,0.001,0.008))], M.wireRed, 0.00085, 'power'));
   W.add(makeWire([tpP.clone().add(new THREE.Vector3(0.004,0.002,0.004)), swP.clone().add(new THREE.Vector3(-0.002,0,0))], M.wireRed, 0.00085, 'power'));
-  W.add(makeWire([swP.clone().add(new THREE.Vector3(0,0,0.003)), new THREE.Vector3(0.038,0.008,-0.05), mtP.clone().add(new THREE.Vector3(0,0,0.012))], M.wireRed, 0.00085, 'power'));
+  W.add(makeWire([swP.clone().add(new THREE.Vector3(0.003,0,0.003)), new THREE.Vector3(0.038,0.008,-0.05), mtP.clone().add(new THREE.Vector3(0,0,0.012))], M.wireRed, 0.00085, 'power'));
   W.add(makeWire([mtP.clone().add(new THREE.Vector3(-0.006,0.002,-0.01)), espTarget.clone().add(new THREE.Vector3(0.009,0,0.006))], M.wireRed, 0.0009, 'power'));
   W.add(makeWire([battP.clone().add(new THREE.Vector3(-0.005,0.002,0)), new THREE.Vector3(-0.005,0.006,-0.055), espTarget.clone().add(new THREE.Vector3(-0.009,0,-0.004))], M.wireBlack, 0.0009, 'power'));
 
@@ -1738,9 +1759,20 @@ buildWiring();
 registerFlexInteractables();
 
 // ============================================================
-// CAMERA VIEWS & ANIMATION (Matching Reference Image Panels)
+// CAMERA VIEWS & ORIENTATION LOGIC
 // ============================================================
-const CAMERA_PRESETS = {
+const CAMERA_PRESETS_VERTICAL = {
+  hero:       {pos:[0.14, 0.04, 0.28],   target:[0, 0.00, 0]},
+  dorsal:     {pos:[0, 0.00, 0.32],      target:[0, 0.00, 0]},
+  palm:       {pos:[0, 0.00, -0.32],     target:[0, 0.00, 0]},
+  thumb:      {pos:[-0.28, 0.00, 0.02],  target:[-0.02, 0.00, 0]},
+  pinky:      {pos:[0.28, 0.00, 0.02],   target:[0.02, 0.00, 0]},
+  fingertips: {pos:[0, 0.24, 0.06],      target:[0, 0.08, 0]},
+  wrist:      {pos:[0.04, -0.16, 0.16],  target:[0, -0.08, 0]},
+  mcu:        {pos:[0.01, -0.02, 0.15],  target:[0, -0.02, 0]}
+};
+
+const CAMERA_PRESETS_FLAT = {
   hero:       {pos:[0.18, 0.22, 0.32],   target:[0, 0.008, 0]},
   dorsal:     {pos:[0, 0.36, -0.015],    target:[0, 0.006, -0.015]},
   palm:       {pos:[0, -0.32, 0.01],     target:[0, -0.005, 0.01]},
@@ -1751,6 +1783,24 @@ const CAMERA_PRESETS = {
   mcu:        {pos:[0.03, 0.11, 0.02],   target:[0.004, 0.008, -0.018]}
 };
 
+function toggleOrientation(){
+  isVertical = !isVertical;
+  const btn = document.getElementById('btnOrient');
+  btn.textContent = isVertical ? 'Pose: Vertical' : 'Pose: Flat';
+  btn.classList.toggle('active', isVertical);
+
+  if(isVertical){
+    targetGroupRot = {x: Math.PI / 2, y: Math.PI, z: 0};
+    targetGroupPos = {x: 0, y: -0.015, z: 0};
+    floor.position.y = -0.130;
+  } else {
+    targetGroupRot = {x: 0, y: 0, z: 0};
+    targetGroupPos = {x: 0, y: 0, z: 0};
+    floor.position.y = -0.026;
+  }
+  setView('hero');
+}
+
 function setView(name){
   document.querySelectorAll('#topBar .btn').forEach(b=>{
     if(b.id.startsWith('btnView')) b.classList.remove('active');
@@ -1758,7 +1808,8 @@ function setView(name){
   const btn = document.getElementById('btnView' + name.charAt(0).toUpperCase() + name.slice(1));
   if(btn) btn.classList.add('active');
 
-  const p = CAMERA_PRESETS[name] || CAMERA_PRESETS.hero;
+  const presets = isVertical ? CAMERA_PRESETS_VERTICAL : CAMERA_PRESETS_FLAT;
+  const p = presets[name] || presets.hero;
   flyTo(new THREE.Vector3(...p.target), 0.35, new THREE.Vector3(...p.pos));
 }
 
@@ -1887,6 +1938,8 @@ function toggleMode(){
 // ============================================================
 function onSliderBend(fingerIdx, deg){
   deg = parseFloat(deg);
+  currentBends[fingerIdx] = deg;
+  targetBends[fingerIdx] = deg;
   setFingerBend(fingerIdx, deg);
 }
 
@@ -1943,13 +1996,11 @@ function playGesture(idx){
   document.getElementById('hudConf').textContent = `${(96 + Math.random()*3.5).toFixed(1)}%`;
   document.getElementById('hudIMU').textContent = `P: ${g.pitch}° | R: ${g.roll}°`;
 
-  // Animate finger sliders smoothly
+  // Set target bends for smooth animation (animate loop will lerp)
   g.bends.forEach((deg, fi)=>{
+    targetBends[fi] = deg;
     const rng = document.getElementById(['rngThumb','rngIndex','rngMiddle','rngRing','rngPinky'][fi]);
-    if(rng){
-      rng.value = deg;
-      setFingerBend(fi, deg);
-    }
+    if(rng) rng.value = deg;
   });
 
   // Synthesize WebAudio Speech Formant Tone
@@ -2041,7 +2092,9 @@ function onPointerMove(e){
 function onPointerClick(e){
   if(hoveredObj){
     selectComponent(hoveredObj.id);
-    flyTo(hoveredObj.pos, 0.16);
+    const worldPos = new THREE.Vector3();
+    hoveredObj.mesh.getWorldPosition(worldPos);
+    flyTo(worldPos, 0.16);
   }
 }
 
@@ -2098,9 +2151,13 @@ function toggleLayer(layerName, visible){
   if(groups[layerName]) groups[layerName].visible = visible;
 }
 
-// Initial Selection
+// Initial Selection & View
 selectComponent('esp32');
+// Set initial gesture immediately (no animation for the first pose)
 playGesture(0);
+currentBends = [...GESTURES[0].bends];
+GESTURES[0].bends.forEach((deg, fi) => setFingerBend(fi, deg));
+setView('hero');
 
 // ============================================================
 // MAIN RENDER LOOP
@@ -2111,6 +2168,32 @@ function animate(time){
   requestAnimationFrame(animate);
 
   controls.update();
+
+  // Smooth rotation & position interpolation for orientation toggle
+  mainGloveGroup.rotation.x += (targetGroupRot.x - mainGloveGroup.rotation.x) * 0.08;
+  mainGloveGroup.rotation.y += (targetGroupRot.y - mainGloveGroup.rotation.y) * 0.08;
+  mainGloveGroup.rotation.z += (targetGroupRot.z - mainGloveGroup.rotation.z) * 0.08;
+  mainGloveGroup.position.y += (targetGroupPos.y - mainGloveGroup.position.y) * 0.08;
+
+  // Smooth finger bend animation (lerp currentBends toward targetBends)
+  const sliderNames = ['rngThumb','rngIndex','rngMiddle','rngRing','rngPinky'];
+  for(let fi = 0; fi < 5; fi++){
+    const diff = targetBends[fi] - currentBends[fi];
+    if(Math.abs(diff) > BEND_SNAP_THRESHOLD){
+      currentBends[fi] += diff * BEND_LERP_SPEED;
+      setFingerBend(fi, currentBends[fi]);
+      // Animate slider knob in sync
+      const rng = document.getElementById(sliderNames[fi]);
+      if(rng) rng.value = Math.round(currentBends[fi]);
+    } else if(Math.abs(diff) > 0.001){
+      // Final snap
+      currentBends[fi] = targetBends[fi];
+      setFingerBend(fi, currentBends[fi]);
+      const rng = document.getElementById(sliderNames[fi]);
+      if(rng) rng.value = Math.round(currentBends[fi]);
+    }
+  }
+
   updateExplodeAnimation();
 
   // Speaker cone physical vibration oscillation
